@@ -1,6 +1,6 @@
 # ==========================================
-#               IcoCloud v1.1
-#   Converts PLY Point Clouds to OBJ Mesh
+#               IcoCloud v1.2
+#   Converts PLY to OBJ with Height Crop
 # ==========================================
 
 import os
@@ -35,6 +35,7 @@ ico_faces_unit = [
 
 # ----------------- PARSER -----------------
 def get_struct_char(prop_type):
+    prop_type = prop_type.lower()
     if prop_type in ['char', 'int8']: return 'b'
     if prop_type in ['uchar', 'uint8']: return 'B'
     if prop_type in ['short', 'int16']: return 'h'
@@ -51,7 +52,7 @@ def read_ply_vertices(path):
         header_lines = []
         while True:
             line = f.readline().strip()
-            header_lines.append(line.decode('ascii'))
+            header_lines.append(line.decode('ascii', errors='ignore'))
             if line == b"end_header": break
 
         vertex_count = 0
@@ -92,40 +93,77 @@ def read_ply_vertices(path):
             endian_char = ">" if is_big_endian else "<"
             struct_fmt = endian_char + "".join([p[1] for p in props])
             stride = struct.calcsize(struct_fmt)
-            for _ in range(vertex_count):
-                data = f.read(stride)
-                if len(data) < stride: break
-                u = struct.unpack(struct_fmt, data)
-                verts.append((u[ix], u[iy], u[iz]))
+            
+            # Read all at once for speed
+            full_data = f.read(stride * vertex_count)
+            try:
+                # Fast method (Python 3.4+)
+                iterator = struct.iter_unpack(struct_fmt, full_data)
+                verts = [(u[ix], u[iy], u[iz]) for u in iterator]
+            except:
+                # Slow fallback
+                for i in range(0, len(full_data), stride):
+                    u = struct.unpack(struct_fmt, full_data[i:i+stride])
+                    verts.append((u[ix], u[iy], u[iz]))
         else:
             for _ in range(vertex_count):
                 line_data = f.readline().split()
                 if not line_data: break
-                v = [float(val) for val in line_data]
-                verts.append((v[ix], v[iy], v[iz]))
+                try:
+                    v = [float(val) for val in line_data]
+                    verts.append((v[ix], v[iy], v[iz]))
+                except: continue
     return verts
 
 # ----------------- PRESETS -----------------
 def apply_preset(verts, preset_id):
-    """
-    Input is assumed to be Z-Up (Scan Data).
-    """
     new_verts = []
     print("  -> Transforming Coords...")
     
     # PRESET 1: Standard OBJ (Y-UP)
-    # Why? Blender/Unity importers expect Y-Up files. 
-    # Even though Blender is Z-Up internally, it rotates OBJs on import.
-    # So we must give it Y-Up data so it rotates correctly to Z-Up.
     if preset_id == 1:
+        # Rotates (x, y, z) -> (x, z, -y)
+        # Result: The new Y axis is the old Z axis.
         for x, y, z in verts:
             new_verts.append((x, z, -y))
 
     # PRESET 2: Raw (Z-UP)
-    # Why? 3ds Max / CAD often treat Z as Z and don't rotate on import.
     elif preset_id == 2:
         return verts # Keep as is
             
+    return new_verts
+
+# ----------------- CROP HELPER -----------------
+def crop_vertical(verts, up_axis_index):
+    # Calculate limits
+    heights = [v[up_axis_index] for v in verts]
+    min_h = min(heights)
+    max_h = max(heights)
+    
+    print("\n--------------------------")
+    print("   HEIGHT CROP (RAM SAVER)")
+    print("--------------------------")
+    print(f"Total Height Range: {min_h:.2f} to {max_h:.2f}")
+    print("Enter the range you want to KEEP.")
+    
+    try:
+        lower_cut_str = input(f"Bottom Cut (Lowest allowed) [{min_h:.2f}]: ")
+        lower_cut = float(lower_cut_str) if lower_cut_str.strip() else min_h
+        
+        upper_cut_str = input(f"Top Cut (Highest allowed) [{max_h:.2f}]: ")
+        upper_cut = float(upper_cut_str) if upper_cut_str.strip() else max_h
+    except ValueError:
+        print("Invalid number entered. Skipping crop.")
+        return verts
+
+    print("  -> Cropping points...")
+    new_verts = []
+    for v in verts:
+        h = v[up_axis_index]
+        if h >= lower_cut and h <= upper_cut:
+            new_verts.append(v)
+            
+    print(f"  -> Reduced from {len(verts)} to {len(new_verts)} points.")
     return new_verts
 
 # ----------------- WRITER -----------------
@@ -160,8 +198,9 @@ def write_ico_spheres(out_file, verts, radius, world_scale):
 
 # ----------------- MAIN -----------------
 def main():
-    ply_files = [f for f in os.listdir("./") if f.lower().endswith(".ply")]
-    if not ply_files: print("No .ply files found."); return
+    current_dir = os.getcwd()
+    ply_files = [f for f in os.listdir(current_dir) if f.lower().endswith(".ply")]
+    if not ply_files: print("No .ply files found."); input(); return
 
     print("Found .PLY files:")
     for i,f in enumerate(ply_files): print(f"{i}: {f}")
@@ -172,29 +211,13 @@ def main():
     except: print("Invalid."); return
 
     print("\nTARGET SOFTWARE PRESET:")
-    print("1 = Blender / Unity / Maya")
-    print("    (Converts to Y-Up so Blender's importer rotates it correctly)")
-    print("2 = 3ds Max / Unreal / CAD")
-    print("    (Keeps Raw Z-Up)")
+    print("1 = Blender / Unity (Y-Up)")
+    print("2 = CAD / Raw (Z-Up)")
     
     try:
-        preset_in = input("Select Preset [1 or 2]: ")
+        preset_in = input("Select Preset [1]: ")
         preset = int(preset_in) if preset_in.strip() else 1
     except ValueError: preset = 1
-
-    print("\nLOD LEVELS:")
-    print("0 = 100%")
-    print("1 = 10%")
-    print("2 = 25%")
-    print("3 = 50%")
-    
-    try:
-        lod_in = input("Choose LOD [Default=0]: ")
-        lod = int(lod_in) if lod_in.strip() else 0
-    except ValueError: lod = 0
-
-    lod_map = {0:1.0, 1:0.10, 2:0.25, 3:0.50}
-    keep_ratio = lod_map.get(lod, 1.0)
 
     print(f"\nReading {ply_name}...")
     try:
@@ -203,7 +226,33 @@ def main():
         print(f"Error: {e}")
         return
 
+    # 1. Apply Rotation
     verts = apply_preset(verts, preset)
+
+    # 2. Apply CROP (New Step)
+    # If preset 1 (Blender), Height is Y (index 1)
+    # If preset 2 (Raw), Height is Z (index 2)
+    up_axis = 1 if preset == 1 else 2
+    verts = crop_vertical(verts, up_axis)
+
+    if len(verts) == 0:
+        print("Error: You cropped out all the points!")
+        return
+
+    # 3. Apply LOD (Random Subsample)
+    print("\nRANDOM LOD (Reduce density, keep shape):")
+    print("0 = 100% (Keep All)")
+    print("1 = 50%")
+    print("2 = 25%")
+    print("3 = 10%")
+    
+    try:
+        lod_in = input("Choose LOD [Default=0]: ")
+        lod = int(lod_in) if lod_in.strip() else 0
+    except ValueError: lod = 0
+
+    lod_map = {0:1.0, 1:0.50, 2:0.25, 3:0.10}
+    keep_ratio = lod_map.get(lod, 1.0)
 
     if keep_ratio < 1.0:
         target = int(len(verts) * keep_ratio)
@@ -212,7 +261,7 @@ def main():
         verts = random.sample(verts, target)
 
     try:
-        s_scale = input("World Scale (default 1.0): ")
+        s_scale = input("\nWorld Scale (default 1.0): ")
         w_scale = float(s_scale) if s_scale.strip() else 1.0
         
         s_rad = input(f"Sphere Radius (default {ICO_RADIUS}): ")
@@ -221,11 +270,12 @@ def main():
         w_scale = 1.0; ico_rad = ICO_RADIUS
 
     base = os.path.splitext(ply_name)[0]
-    out_file = f"{base}_LOD{lod}.obj"
+    out_file = f"{base}_CROPPED.obj"
 
     print(f"Generating OBJ...")
     write_ico_spheres(out_file, verts, ico_rad, w_scale)
     print("DONE! Saved:", out_file)
+    input("Press Enter to Exit")
 
 if __name__ == "__main__":
     main()
