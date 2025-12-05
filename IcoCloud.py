@@ -1,5 +1,5 @@
 # ==========================================
-#               IcoCloud v1.0
+#               IcoCloud v1.1
 #   Converts PLY Point Clouds to OBJ Mesh
 # ==========================================
 
@@ -10,20 +10,17 @@ import struct
 import sys
 
 # ----------------- PARAMETERS -----------------
-ICO_RADIUS = 0.01   # radius of each ico sphere
+ICO_RADIUS = 0.01   # default radius
 
-# Generate Low-poly icosphere (icosahedron)
-# Golden ratio
+# ----------------- ICOSPHERE GEOMETRY -----------------
 t = (1.0 + math.sqrt(5.0)) / 2.0
-
-# Raw vertices (magnitude is approx 1.902, not 1.0)
 raw_verts = [
     (-1,  t, 0), (1,  t, 0), (-1, -t, 0), (1, -t, 0),
     (0, -1,  t), (0, 1,  t), (0, -1, -t), (0, 1, -t),
     ( t, 0, -1), ( t, 0, 1), (-t, 0, -1), (-t, 0, 1)
 ]
 
-# FIX 1: Normalize vertices so they lie exactly on a unit sphere (radius 1.0)
+# Normalize
 ico_verts_unit = []
 for (x, y, z) in raw_verts:
     length = math.sqrt(x*x + y*y + z*z)
@@ -36,158 +33,165 @@ ico_faces_unit = [
     (4, 9, 5), (2, 4, 11), (6, 2, 10), (8, 6, 7), (9, 8, 1)
 ]
 
-# ----------------- PLY HELPER -----------------
-def get_property_size(prop_type):
-    """Returns byte size for PLY property types."""
-    if prop_type in ['char', 'uchar', 'int8', 'uint8']: return 1
-    if prop_type in ['short', 'ushort', 'int16', 'uint16']: return 2
-    if prop_type in ['int', 'uint', 'float', 'int32', 'uint32', 'float32']: return 4
-    if prop_type in ['double', 'float64']: return 8
-    return 0
+# ----------------- PARSER -----------------
+def get_struct_char(prop_type):
+    if prop_type in ['char', 'int8']: return 'b'
+    if prop_type in ['uchar', 'uint8']: return 'B'
+    if prop_type in ['short', 'int16']: return 'h'
+    if prop_type in ['ushort', 'uint16']: return 'H'
+    if prop_type in ['int', 'int32']: return 'i'
+    if prop_type in ['uint', 'uint32']: return 'I'
+    if prop_type in ['float', 'float32']: return 'f'
+    if prop_type in ['double', 'float64']: return 'd'
+    return None
 
-# ----------------- READ PLY -----------------
 def read_ply_vertices(path):
     verts = []
     with open(path, "rb") as f:
-        # Header Parsing
-        line = ""
         header_lines = []
-        while line != "end_header":
-            line = f.readline().decode("ascii").strip()
-            header_lines.append(line)
+        while True:
+            line = f.readline().strip()
+            header_lines.append(line.decode('ascii'))
+            if line == b"end_header": break
 
-        # Parse Header info
         vertex_count = 0
         is_binary = False
         is_big_endian = False
-        
-        # We need to calculate stride (bytes per vertex) to skip colors/normals
-        vertex_byte_size = 0
+        props = []
         in_vertex_element = False
         
         for line in header_lines:
             parts = line.split()
             if not parts: continue
-            
             if parts[0] == "format":
-                if "binary_little_endian" in parts[1]:
-                    is_binary = True
-                elif "binary_big_endian" in parts[1]:
-                    is_binary = True
-                    is_big_endian = True
-            
+                if "binary_little_endian" in parts[1]: is_binary = True
+                elif "binary_big_endian" in parts[1]: is_binary = True; is_big_endian = True
             elif parts[0] == "element":
                 if parts[1] == "vertex":
                     vertex_count = int(parts[2])
                     in_vertex_element = True
-                else:
-                    in_vertex_element = False
-            
+                else: in_vertex_element = False
             elif parts[0] == "property" and in_vertex_element:
-                # Assuming standard 'property float x' structure
-                # Handling list properties (rare for vertex, usually face) is complex, skipped here.
-                prop_type = parts[1]
-                vertex_byte_size += get_property_size(prop_type)
+                dtype = parts[1]
+                name = parts[-1]
+                if dtype == "list": continue
+                fmt_char = get_struct_char(dtype)
+                if fmt_char: props.append((name, fmt_char))
 
-        print(f"  -> Format: {'Binary' if is_binary else 'ASCII'}")
-        print(f"  -> Count: {vertex_count}")
-        if is_binary:
-            print(f"  -> Stride: {vertex_byte_size} bytes per vertex")
+        idx_map = {'x': -1, 'y': -1, 'z': -1}
+        for i, (name, char) in enumerate(props):
+            if name in idx_map: idx_map[name] = i
 
-        # Reading Data
+        if -1 in idx_map.values(): raise ValueError("PLY missing x, y, or z.")
+        
+        print(f"  -> Format: {'Binary' if is_binary else 'ASCII'} | Count: {vertex_count}")
+        
+        ix, iy, iz = idx_map['x'], idx_map['y'], idx_map['z']
+        
         if is_binary:
-            # FIX 2: Handle binary stride correctly
-            # We assume x, y, z are the FIRST 3 properties. 
-            # If they are float (4 bytes), that's 12 bytes.
             endian_char = ">" if is_big_endian else "<"
-            fmt = endian_char + "fff" # Read 3 floats
-            
-            # The remaining bytes in this vertex (colors, normals, etc)
-            remainder = vertex_byte_size - 12 
-
+            struct_fmt = endian_char + "".join([p[1] for p in props])
+            stride = struct.calcsize(struct_fmt)
             for _ in range(vertex_count):
-                data = f.read(12)
-                if len(data) < 12: break
-                x, y, z = struct.unpack(fmt, data)
-                verts.append((x, y, z))
-                
-                if remainder > 0:
-                    f.read(remainder) # Skip extra data
+                data = f.read(stride)
+                if len(data) < stride: break
+                u = struct.unpack(struct_fmt, data)
+                verts.append((u[ix], u[iy], u[iz]))
         else:
-            # ASCII Reader
             for _ in range(vertex_count):
                 line_data = f.readline().split()
-                # Assuming first 3 columns are X Y Z
-                x, y, z = map(float, line_data[:3])
-                verts.append((x, y, z))
-
+                if not line_data: break
+                v = [float(val) for val in line_data]
+                verts.append((v[ix], v[iy], v[iz]))
     return verts
 
-# ----------------- WRITE OBJ -----------------
-def write_ico_spheres(out_file, verts, radius=0.01, world_scale=1.0):
+# ----------------- PRESETS -----------------
+def apply_preset(verts, preset_id):
+    """
+    Input is assumed to be Z-Up (Scan Data).
+    """
+    new_verts = []
+    print("  -> Transforming Coords...")
+    
+    # PRESET 1: Standard OBJ (Y-UP)
+    # Why? Blender/Unity importers expect Y-Up files. 
+    # Even though Blender is Z-Up internally, it rotates OBJs on import.
+    # So we must give it Y-Up data so it rotates correctly to Z-Up.
+    if preset_id == 1:
+        for x, y, z in verts:
+            new_verts.append((x, z, -y))
+
+    # PRESET 2: Raw (Z-UP)
+    # Why? 3ds Max / CAD often treat Z as Z and don't rotate on import.
+    elif preset_id == 2:
+        return verts # Keep as is
+            
+    return new_verts
+
+# ----------------- WRITER -----------------
+def write_ico_spheres(out_file, verts, radius, world_scale):
     v_offset = 0
     total = len(verts)
     
     with open(out_file, "w") as out:
-        out.write(f"# OBJ generated from PLY pointcloud\n")
-        out.write(f"# Total spheres: {total}\n")
+        out.write(f"# OBJ from PLY\n")
         
         for i, (vx, vy, vz) in enumerate(verts):
-            # Progress indicator for large files
-            if i % 5000 == 0:
+            if i % 2000 == 0:
                 sys.stdout.write(f"\rWriting... {int((i/total)*100)}%")
                 sys.stdout.flush()
 
-            # Apply world scale to position
             w_vx = vx * world_scale
             w_vy = vy * world_scale
             w_vz = vz * world_scale
 
-            # Write vertices of ico sphere (radius applied locally)
             for (ix, iy, iz) in ico_verts_unit:
                 px = w_vx + ix * radius
                 py = w_vy + iy * radius
                 pz = w_vz + iz * radius
                 out.write(f"v {px:.6f} {py:.6f} {pz:.6f}\n")
 
-            # Write faces
             for (f1, f2, f3) in ico_faces_unit:
-                # Face indices are 1-based in OBJ
                 out.write(f"f {v_offset+f1+1} {v_offset+f2+1} {v_offset+f3+1}\n")
 
             v_offset += len(ico_verts_unit)
             
-    print("\rWriting... 100%   ")
+    print("\rWriting... 100%   \n")
 
 # ----------------- MAIN -----------------
 def main():
-    # List PLY files
     ply_files = [f for f in os.listdir("./") if f.lower().endswith(".ply")]
-    if not ply_files:
-        print("No .ply files found in current directory.")
-        return
+    if not ply_files: print("No .ply files found."); return
 
     print("Found .PLY files:")
-    for i,f in enumerate(ply_files):
-        print(f"{i}: {f}")
+    for i,f in enumerate(ply_files): print(f"{i}: {f}")
 
     try:
-        idx = int(input("Select the PLY file number: "))
+        idx = int(input("Select PLY file #: "))
         ply_name = ply_files[idx]
-    except (ValueError, IndexError):
-        print("Invalid selection.")
-        return
+    except: print("Invalid."); return
 
-    print("\nLOD LEVELS (Random Sampling):")
-    print("0 = original (100%)")
-    print("1 = low    (10%)")
-    print("2 = medium (25%)")
-    print("3 = high   (50%)")
+    print("\nTARGET SOFTWARE PRESET:")
+    print("1 = Blender / Unity / Maya")
+    print("    (Converts to Y-Up so Blender's importer rotates it correctly)")
+    print("2 = 3ds Max / Unreal / CAD")
+    print("    (Keeps Raw Z-Up)")
     
     try:
-        lod = int(input("Choose LOD level: "))
-    except ValueError:
-        lod = 0
+        preset_in = input("Select Preset [1 or 2]: ")
+        preset = int(preset_in) if preset_in.strip() else 1
+    except ValueError: preset = 1
+
+    print("\nLOD LEVELS:")
+    print("0 = 100%")
+    print("1 = 10%")
+    print("2 = 25%")
+    print("3 = 50%")
+    
+    try:
+        lod_in = input("Choose LOD [Default=0]: ")
+        lod = int(lod_in) if lod_in.strip() else 0
+    except ValueError: lod = 0
 
     lod_map = {0:1.0, 1:0.10, 2:0.25, 3:0.50}
     keep_ratio = lod_map.get(lod, 1.0)
@@ -196,10 +200,10 @@ def main():
     try:
         verts = read_ply_vertices(ply_name)
     except Exception as e:
-        print(f"Error reading PLY: {e}")
+        print(f"Error: {e}")
         return
 
-    print(f"Loaded {len(verts)} vertices.")
+    verts = apply_preset(verts, preset)
 
     if keep_ratio < 1.0:
         target = int(len(verts) * keep_ratio)
@@ -208,19 +212,19 @@ def main():
         verts = random.sample(verts, target)
 
     try:
-        str_scale = input("Enter world scale for positions (default 1.0): ")
-        world_scale = float(str_scale) if str_scale.strip() else 1.0
+        s_scale = input("World Scale (default 1.0): ")
+        w_scale = float(s_scale) if s_scale.strip() else 1.0
+        
+        s_rad = input(f"Sphere Radius (default {ICO_RADIUS}): ")
+        ico_rad = float(s_rad) if s_rad.strip() else ICO_RADIUS
     except ValueError:
-        world_scale = 1.0
+        w_scale = 1.0; ico_rad = ICO_RADIUS
 
     base = os.path.splitext(ply_name)[0]
-    out_file = f"{base}_LOD{lod}_ico.obj"
+    out_file = f"{base}_LOD{lod}.obj"
 
-    print(f"Generating ico spheres for {len(verts)} points...")
-    print(f"Sphere Radius: {ICO_RADIUS}")
-    print(f"Position Scale: {world_scale}")
-    
-    write_ico_spheres(out_file, verts, radius=ICO_RADIUS, world_scale=world_scale)
+    print(f"Generating OBJ...")
+    write_ico_spheres(out_file, verts, ico_rad, w_scale)
     print("DONE! Saved:", out_file)
 
 if __name__ == "__main__":
